@@ -1,0 +1,38 @@
+# Digital Wallet System Backend (Flask)
+
+This project is a digital wallet backend system built with Flask and MongoDB.
+
+## Features
+
+- User Registration & Login (JWT)
+- Deposit, Withdraw, and Transfer Funds
+- Fraud Detection
+- Admin Dashboard
+
+## Setup
+
+```bash
+pip install -r requirements.txt
+```
+
+Add a `.env` file with:
+```
+MONGO_URI=mongodb://localhost:27017/wallet
+JWT_SECRET_KEY=your_jwt_secret
+```
+
+Run:
+```bash
+python app.py
+```
+
+## API Endpoints
+
+- POST /api/auth/register
+- POST /api/auth/login
+- POST /api/wallet/deposit
+- POST /api/wallet/withdraw
+- POST /api/wallet/transfer
+- GET /api/admin/flagged
+- GET /api/admin/top-users
+- GET /api/admin/total-balance
