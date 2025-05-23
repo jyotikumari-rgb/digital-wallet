@@ -1,0 +1,208 @@
+# File: requirements.txt
+# ------------------------
+Flask
+Flask-JWT-Extended
+Flask-PyMongo
+bcrypt
+python-dotenv
+
+# ------------------------
+# File: .env
+# ------------------------
+MONGO_URI=mongodb://localhost:27017/wallet
+JWT_SECRET_KEY=your_jwt_secret
+
+# ------------------------
+# File: app.py
+# ------------------------
+from flask import Flask
+from flask_pymongo import PyMongo
+from flask_jwt_extended import JWTManager
+from dotenv import load_dotenv
+import os
+
+from routes.auth import auth_bp
+from routes.wallet import wallet_bp
+from routes.admin import admin_bp
+
+load_dotenv()
+
+app = Flask(__name__)
+app.config["MONGO_URI"] = os.getenv("MONGO_URI")
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
+
+mongo = PyMongo(app)
+jwt = JWTManager(app)
+
+app.mongo = mongo
+
+app.register_blueprint(auth_bp, url_prefix="/api/auth")
+app.register_blueprint(wallet_bp, url_prefix="/api/wallet")
+app.register_blueprint(admin_bp, url_prefix="/api/admin")
+
+if __name__ == "__main__":
+    app.run(debug=True)
+
+# ------------------------
+# File: models/user.py
+# ------------------------
+from werkzeug.security import generate_password_hash, check_password_hash
+
+def create_user_collection(mongo):
+    users = mongo.db.users
+    users.create_index("email", unique=True)
+    return users
+
+def hash_password(password):
+    return generate_password_hash(password)
+
+def check_password(password, hash):
+    return check_password_hash(hash, password)
+
+# ------------------------
+# File: models/transaction.py
+# ------------------------
+def create_transaction(mongo, tx):
+    return mongo.db.transactions.insert_one(tx)
+
+def get_recent_transfers(mongo, user_id, minutes=5):
+    from datetime import datetime, timedelta
+    cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+    return list(mongo.db.transactions.find({
+        "type": "transfer",
+        "sender": user_id,
+        "timestamp": {"$gt": cutoff}
+    }))
+
+# ------------------------
+# File: routes/auth.py
+# ------------------------
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import create_access_token
+from models.user import create_user_collection, hash_password, check_password
+from bson import ObjectId
+
+auth_bp = Blueprint("auth", __name__)
+
+@auth_bp.route("/register", methods=["POST"])
+def register():
+    mongo = auth_bp.root_path.mongo
+    users = create_user_collection(mongo)
+    data = request.json
+    user = {
+        "name": data["name"],
+        "email": data["email"],
+        "password": hash_password(data["password"]),
+        "balance": 0
+    }
+    try:
+        users.insert_one(user)
+        access_token = create_access_token(identity=str(user["_id"]))
+        return jsonify({"token": access_token})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@auth_bp.route("/login", methods=["POST"])
+def login():
+    mongo = auth_bp.root_path.mongo
+    users = mongo.db.users
+    data = request.json
+    user = users.find_one({"email": data["email"]})
+    if user and check_password(data["password"], user["password"]):
+        access_token = create_access_token(identity=str(user["_id"]))
+        return jsonify({"token": access_token})
+    return jsonify({"error": "Invalid credentials"}), 401
+
+# ------------------------
+# File: routes/wallet.py
+# ------------------------
+from flask import Blueprint, request, jsonify, current_app
+from flask_jwt_extended import jwt_required, get_jwt_identity
+from bson import ObjectId
+from models.transaction import create_transaction, get_recent_transfers
+from datetime import datetime
+
+wallet_bp = Blueprint("wallet", __name__)
+
+@wallet_bp.route("/deposit", methods=["POST"])
+@jwt_required()
+def deposit():
+    user_id = ObjectId(get_jwt_identity())
+    amount = request.json["amount"]
+    mongo = current_app.mongo
+    user = mongo.db.users.find_one_and_update(
+        {"_id": user_id},
+        {"$inc": {"balance": amount}}
+    )
+    tx = {"type": "deposit", "amount": amount, "receiver": user_id, "timestamp": datetime.utcnow()}
+    create_transaction(mongo, tx)
+    return jsonify({"balance": user["balance"] + amount})
+
+@wallet_bp.route("/withdraw", methods=["POST"])
+@jwt_required()
+def withdraw():
+    user_id = ObjectId(get_jwt_identity())
+    amount = request.json["amount"]
+    mongo = current_app.mongo
+    user = mongo.db.users.find_one({"_id": user_id})
+    if user["balance"] < amount:
+        return jsonify({"error": "Insufficient funds"}), 400
+    mongo.db.users.update_one({"_id": user_id}, {"$inc": {"balance": -amount}})
+    flagged = amount > 1000
+    tx = {"type": "withdrawal", "amount": amount, "sender": user_id, "flagged": flagged, "timestamp": datetime.utcnow()}
+    create_transaction(mongo, tx)
+    return jsonify({"balance": user["balance"] - amount})
+
+@wallet_bp.route("/transfer", methods=["POST"])
+@jwt_required()
+def transfer():
+    sender_id = ObjectId(get_jwt_identity())
+    data = request.json
+    receiver = current_app.mongo.db.users.find_one({"email": data["toEmail"]})
+    amount = data["amount"]
+    if not receiver:
+        return jsonify({"error": "Receiver not found"}), 404
+
+    sender = current_app.mongo.db.users.find_one({"_id": sender_id})
+    if sender["balance"] < amount:
+        return jsonify({"error": "Insufficient funds"}), 400
+
+    current_app.mongo.db.users.update_one({"_id": sender_id}, {"$inc": {"balance": -amount}})
+    current_app.mongo.db.users.update_one({"_id": receiver["_id"]}, {"$inc": {"balance": amount}})
+
+    recent = get_recent_transfers(current_app.mongo, sender_id)
+    flagged = len(recent) > 3
+    tx = {
+        "type": "transfer",
+        "amount": amount,
+        "sender": sender_id,
+        "receiver": receiver["_id"],
+        "flagged": flagged,
+        "timestamp": datetime.utcnow()
+    }
+    create_transaction(current_app.mongo, tx)
+    return jsonify({"message": "Transfer successful"})
+
+# ------------------------
+# File: routes/admin.py
+# ------------------------
+from flask import Blueprint, jsonify, current_app
+from bson.json_util import dumps
+
+admin_bp = Blueprint("admin", __name__)
+
+@admin_bp.route("/flagged", methods=["GET"])
+def flagged():
+    txs = current_app.mongo.db.transactions.find({"flagged": True})
+    return dumps(txs)
+
+@admin_bp.route("/top-users", methods=["GET"])
+def top_users():
+    users = current_app.mongo.db.users.find().sort("balance", -1).limit(5)
+    return dumps(users)
+
+@admin_bp.route("/total-balance", methods=["GET"])
+def total_balance():
+    users = current_app.mongo.db.users.find()
+    total = sum(user["balance"] for user in users)
+    return jsonify({"total": total})
